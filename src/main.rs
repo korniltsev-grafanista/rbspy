@@ -28,8 +28,9 @@ enum SubCmd {
     /// Record `target`, writing output `output`.
     Record {
         target: Target,
-        out_path: PathBuf,
-        raw_path: PathBuf,
+        out_path: Option<PathBuf>,
+        raw_path: Option<PathBuf>,
+        otlp: Option<rbspy::otlp::Config>,
         sample_rate: u32,
         maybe_duration: Option<std::time::Duration>,
         format: OutputFormat,
@@ -121,6 +122,7 @@ fn do_main() -> Result<(), Error> {
             target,
             out_path,
             raw_path,
+            otlp,
             sample_rate,
             maybe_duration,
             format,
@@ -143,8 +145,8 @@ fn do_main() -> Result<(), Error> {
 
             let config = recorder::RecordConfig {
                 format,
-                raw_path: Some(raw_path.clone()),
-                out_path: Some(out_path.clone()),
+                raw_path: raw_path.clone(),
+                out_path: out_path.clone(),
                 pid,
                 with_subprocesses,
                 sample_rate,
@@ -155,7 +157,11 @@ fn do_main() -> Result<(), Error> {
                 on_cpu_only,
             };
 
-            let recorder = Arc::<recorder::Recorder>::new(recorder::Recorder::new(config));
+            let mut recorder = recorder::Recorder::new(config);
+            if let Some(otlp) = otlp {
+                recorder = recorder.with_otlp(otlp)?;
+            }
+            let recorder = Arc::new(recorder);
             let recorder_handler = recorder.clone();
             let recorder_summary = recorder.clone();
             let interrupted = Arc::<AtomicBool>::new(AtomicBool::new(false));
@@ -213,14 +219,12 @@ fn do_main() -> Result<(), Error> {
 
             interrupted.store(true, Ordering::Relaxed);
             summary_thread.join().expect("couldn't join summary thread");
-            eprintln!(
-                "{}",
-                format!(
-                    "Wrote raw data to {}\nWrote formatted output to {}",
-                    raw_path.display(),
-                    out_path.display()
-                )
-            );
+            if let Some(path) = raw_path {
+                eprintln!("Wrote raw data to {}", path.display());
+            }
+            if let Some(path) = out_path {
+                eprintln!("Wrote formatted output to {}", path.display());
+            }
 
             recording_result
         }
@@ -291,6 +295,9 @@ fn arg_parser() -> clap::Command {
         .subcommand(
             clap::Command::new("record")
                 .about("Continuously capture traces from a Ruby process")
+                .arg(arg!(--"otlp-endpoint" <URL> "Full OTLP/HTTP profiles URL, e.g. http://localhost:4318/v1development/profiles"))
+                .arg(arg!(--"otlp-interval" <SECONDS> "Seconds between profile exports").value_parser(clap::value_parser!(u64).range(1..=86400)).default_value("60"))
+                .arg(arg!(--"service-name" <NAME> "OTLP service.name").default_value("ruby"))
                 .arg(
                     arg!(-p --pid <PID> "PID of the Ruby process you want to profile")
                     .value_parser(validate_pid)
@@ -311,7 +318,7 @@ fn arg_parser() -> clap::Command {
                 )
                 .arg(
                     arg!(-r --rate <RATE> "Samples per second collected")
-                        .value_parser(clap::value_parser!(u32))
+                        .value_parser(clap::value_parser!(u32).range(1..=1_000_000_000))
                         .required(false)
                         .default_value("99"),
                 )
@@ -460,14 +467,31 @@ impl Args {
                         .unwrap()
                         .clone();
 
-                let raw_path = output_filename(
-                    submatches.get_one::<String>("raw-file").map(|x| x.as_str()),
-                    "raw.gz",
-                )?;
-                let out_path = output_filename(
-                    submatches.get_one::<String>("file").map(|x| x.as_str()),
-                    &format.extension(),
-                )?;
+                let otlp = submatches
+                    .get_one::<String>("otlp-endpoint")
+                    .map(|endpoint| rbspy::otlp::Config {
+                        endpoint: endpoint.clone(),
+                        service_name: submatches
+                            .get_one::<String>("service-name")
+                            .unwrap()
+                            .clone(),
+                        interval: Duration::from_secs(
+                            *submatches.get_one::<u64>("otlp-interval").unwrap(),
+                        ),
+                    });
+                if let Some(config) = &otlp {
+                    config.validate()?;
+                }
+                let output_path = |arg: &str, extension: &str| -> Result<Option<PathBuf>> {
+                    let filename = submatches.get_one::<String>(arg).map(String::as_str);
+                    if otlp.is_some() && filename.is_none() {
+                        Ok(None)
+                    } else {
+                        output_filename(filename, extension).map(Some)
+                    }
+                };
+                let raw_path = output_path("raw-file", "raw.gz")?;
+                let out_path = output_path("file", &format.extension())?;
                 let maybe_duration = match ArgMatches::get_one::<u64>(submatches, "duration") {
                     Some(integer_duration) => {
                         Some(std::time::Duration::from_secs(*integer_duration))
@@ -503,6 +527,7 @@ impl Args {
                     target,
                     out_path,
                     raw_path,
+                    otlp,
                     sample_rate,
                     maybe_duration,
                     format,
@@ -688,8 +713,9 @@ mod tests {
             Args {
                 cmd: SubCmd::Record {
                     target: Target::Pid { pid: 1234 },
-                    out_path: "foo.txt".into(),
-                    raw_path: "raw.gz".into(),
+                    out_path: Some("foo.txt".into()),
+                    raw_path: Some("raw.gz".into()),
+                    otlp: None,
                     sample_rate: 99,
                     maybe_duration: None,
                     format: OutputFormat::flamegraph,
@@ -713,8 +739,9 @@ mod tests {
             Args {
                 cmd: SubCmd::Record {
                     target: Target::Pid { pid: 1234 },
-                    out_path: "foo.txt".into(),
-                    raw_path: "raw.gz".into(),
+                    out_path: Some("foo.txt".into()),
+                    raw_path: Some("raw.gz".into()),
+                    otlp: None,
                     sample_rate: 25,
                     maybe_duration: None,
                     format: OutputFormat::flamegraph,
@@ -738,8 +765,9 @@ mod tests {
             Args {
                 cmd: SubCmd::Record {
                     target: Target::Pid { pid: 1234 },
-                    out_path: "foo.txt".into(),
-                    raw_path: "raw.gz".into(),
+                    out_path: Some("foo.txt".into()),
+                    raw_path: Some("raw.gz".into()),
+                    otlp: None,
                     sample_rate: 99,
                     maybe_duration: Some(std::time::Duration::from_secs(60)),
                     format: OutputFormat::flamegraph,
@@ -762,8 +790,9 @@ mod tests {
             Args {
                 cmd: SubCmd::Record {
                     target: Target::Pid { pid: 1234 },
-                    out_path: "foo.txt".into(),
-                    raw_path: "raw.gz".into(),
+                    out_path: Some("foo.txt".into()),
+                    raw_path: Some("raw.gz".into()),
+                    otlp: None,
                     sample_rate: 99,
                     maybe_duration: Some(std::time::Duration::from_secs(60)),
                     format: OutputFormat::callgrind,
@@ -787,8 +816,9 @@ mod tests {
             Args {
                 cmd: SubCmd::Record {
                     target: Target::Pid { pid: 1234 },
-                    out_path: "foo.txt".into(),
-                    raw_path: "raw.gz".into(),
+                    out_path: Some("foo.txt".into()),
+                    raw_path: Some("raw.gz".into()),
+                    otlp: None,
                     sample_rate: 99,
                     maybe_duration: None,
                     format: OutputFormat::flamegraph,
@@ -812,8 +842,9 @@ mod tests {
             Args {
                 cmd: SubCmd::Record {
                     target: Target::Pid { pid: 1234 },
-                    out_path: "foo.txt".into(),
-                    raw_path: "raw.gz".into(),
+                    out_path: Some("foo.txt".into()),
+                    raw_path: Some("raw.gz".into()),
+                    otlp: None,
                     sample_rate: 99,
                     maybe_duration: None,
                     format: OutputFormat::flamegraph,
@@ -837,8 +868,9 @@ mod tests {
             Args {
                 cmd: SubCmd::Record {
                     target: Target::Pid { pid: 1234 },
-                    out_path: "foo.txt".into(),
-                    raw_path: "raw.gz".into(),
+                    out_path: Some("foo.txt".into()),
+                    raw_path: Some("raw.gz".into()),
+                    otlp: None,
                     sample_rate: 99,
                     maybe_duration: None,
                     format: OutputFormat::flamegraph,
@@ -862,8 +894,9 @@ mod tests {
             Args {
                 cmd: SubCmd::Record {
                     target: Target::Pid { pid: 1234 },
-                    out_path: "foo.txt".into(),
-                    raw_path: "raw.gz".into(),
+                    out_path: Some("foo.txt".into()),
+                    raw_path: Some("raw.gz".into()),
+                    otlp: None,
                     sample_rate: 99,
                     maybe_duration: None,
                     format: OutputFormat::flamegraph,
@@ -877,6 +910,30 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn test_otlp_args() {
+        let args = Args::from(make_args("rbspy record --pid 1234 --otlp-endpoint http://localhost:4318/v1development/profiles --otlp-interval 10 --service-name checkout")).unwrap();
+        match args.cmd {
+            SubCmd::Record {
+                otlp: Some(config),
+                out_path,
+                raw_path,
+                ..
+            } => {
+                assert_eq!(config.interval, Duration::from_secs(10));
+                assert_eq!(config.service_name, "checkout");
+                assert!(out_path.is_none());
+                assert!(raw_path.is_none());
+            }
+            other => panic!("Unexpected {other:?}"),
+        }
+        for flag in ["--rate", "--otlp-interval"] {
+            assert!(arg_parser()
+                .try_get_matches_from(["rbspy", "record", "--pid", "1234", flag, "0"])
+                .is_err());
+        }
     }
 
     #[test]
