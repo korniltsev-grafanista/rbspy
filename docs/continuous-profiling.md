@@ -49,7 +49,8 @@ docker run --rm -p 127.0.0.1:4318:4318 \
 ```
 
 Replace the debug exporter with a profiles-capable backend exporter for storage.
-OTLP profiles remain experimental: this implementation uses development version
+OTLP profiles have Alpha maturity; the wire package is still `v1development`.
+This implementation uses development version
 **1**, with schema fields from `open-telemetry/opentelemetry-proto` commit
 `09769935deb8b2ebcf73ad1e2142b691d17bf70b`. It sends the
 `OTLP-Profiles-Development-Version: 1` header. Older Collectors can use incompatible
@@ -84,3 +85,39 @@ RBSPY_TEST_OTLP_ENDPOINT=http://localhost:4318/v1development/profiles \
 
 The Collector debug output should contain two profiles with service name
 `rbspy-integration`, PIDs 7 and 8, and the Ruby frame `work` at `app.rb:42`.
+
+### Pyroscope integration test
+
+The exporter is also tested through Collector Contrib 0.156.0 into Pyroscope
+2.4.0. Configure the Collector's profiles pipeline with this exporter:
+
+```yaml
+exporters:
+  otlp_grpc:
+    endpoint: pyroscope:4040
+    tls:
+      insecure: true
+service:
+  pipelines:
+    profiles:
+      receivers: [otlp]
+      exporters: [otlp_grpc]
+```
+
+For a disposable local Pyroscope instance, use
+`grafana/pyroscope:2.4.0 -self-profiling.disable-push=true -write-path=ingester`.
+The ingester path makes profiles immediately queryable; the fresh default v2
+instance used in testing accepted profiles but returned empty query results.
+Place the Collector and Pyroscope on the same Docker network, with `pyroscope`
+as the backend's network alias, and publish their HTTP ports to localhost.
+
+```sh
+RBSPY_TEST_OTLP_ENDPOINT=http://localhost:4318/v1development/profiles \
+RBSPY_TEST_PYROSCOPE_URL=http://localhost:4040 \
+  cargo test --lib pyroscope_integration -- --ignored
+```
+
+This test sends synthetic Ruby stacks through the actual exporter, flushes a
+batch and a final partial batch, and queries Pyroscope for both CPU and wall-time
+profiles. It checks the `work` frame and an exact total of 20,000,000 nanoseconds
+per profile type. It does not exercise sampling a live Ruby process.

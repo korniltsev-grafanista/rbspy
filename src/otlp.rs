@@ -478,10 +478,83 @@ mod tests {
             true,
         )
         .unwrap();
-        exporter.record(&trace(7, 1));
+        let mut first = trace(7, 1);
+        first.time = Some(SystemTime::now());
+        exporter.record(&first);
         exporter.flush();
-        exporter.record(&trace(8, 2));
+        let mut last = trace(8, 2);
+        last.time = Some(SystemTime::now());
+        exporter.record(&last);
         exporter.finish().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires Collector -> Pyroscope, RBSPY_TEST_OTLP_ENDPOINT and RBSPY_TEST_PYROSCOPE_URL"]
+    fn pyroscope_integration() {
+        let endpoint = std::env::var("RBSPY_TEST_OTLP_ENDPOINT").unwrap();
+        let backend = std::env::var("RBSPY_TEST_PYROSCOPE_URL").unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for on_cpu in [true, false] {
+            let kind = if on_cpu { "cpu" } else { "wall" };
+            let start = SystemTime::now();
+            let service = format!("rbspy-integration-{kind}-{}", nanos(start));
+            let mut exporter = Exporter::new(
+                Config {
+                    endpoint: endpoint.clone(),
+                    service_name: service.clone(),
+                    interval: Duration::from_secs(1),
+                },
+                100,
+                on_cpu,
+            )
+            .unwrap();
+            let mut first = trace(7, 1);
+            first.time = Some(start);
+            exporter.record(&first);
+            exporter.flush();
+            let mut last = trace(8, 2);
+            last.time = Some(SystemTime::now());
+            exporter.record(&last);
+            exporter.finish().unwrap();
+            let mut result = json!({});
+            for _ in 0..30 {
+                result = client
+                    .post(format!(
+                        "{}/querier.v1.QuerierService/SelectMergeStacktraces",
+                        backend.trim_end_matches('/')
+                    ))
+                    .json(&json!({
+                        "start": nanos(start) / 1_000_000 - 1000,
+                        "end": nanos(SystemTime::now()) / 1_000_000 + 1000,
+                        "labelSelector": format!("{{service_name=\"{service}\"}}"),
+                        "profileTypeID": format!("{kind}:{kind}:nanoseconds:{kind}:nanoseconds"),
+                    }))
+                    .send()
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .unwrap();
+                if result["flamegraph"]["total"] == "20000000" {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            assert_eq!(
+                result["flamegraph"]["total"], "20000000",
+                "{kind}: {result}"
+            );
+            assert!(
+                result["flamegraph"]["names"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("work")),
+                "{kind}: {result}"
+            );
+        }
     }
 
     #[test]
