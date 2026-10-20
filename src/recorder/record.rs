@@ -53,6 +53,8 @@ pub struct Recorder {
     raw_path: Option<PathBuf>,
     sample_rate: u32,
     sampler: crate::sampler::Sampler,
+    otlp: Option<crate::otlp::Config>,
+    on_cpu_only: bool,
     summary: Arc<Mutex<summary::Stats>>,
 }
 
@@ -75,12 +77,32 @@ impl Recorder {
             raw_path: config.raw_path,
             sample_rate: config.sample_rate,
             sampler,
+            otlp: None,
+            on_cpu_only: config.on_cpu_only,
             summary: Arc::new(Mutex::new(summary::Stats::new())),
         }
     }
 
+    /// Enables periodic OTLP exports alongside any explicitly configured file outputs.
+    pub fn with_otlp(mut self, config: crate::otlp::Config) -> Result<Self> {
+        config.validate()?;
+        self.otlp = Some(config);
+        Ok(self)
+    }
+
     /// Records traces until the process exits or the stop function is called
     pub fn record(&self) -> Result<(), Error> {
+        let mut exporter = self
+            .otlp
+            .clone()
+            .map(|config| crate::otlp::Exporter::new(config, self.sample_rate, self.on_cpu_only))
+            .transpose()?;
+        let interval = self
+            .otlp
+            .as_ref()
+            .map(|c| c.interval)
+            .unwrap_or(std::time::Duration::from_secs(60));
+        let mut next_export = std::time::Instant::now() + interval;
         // Create the sender/receiver channels and start the child threads off collecting stack traces
         // from each target process.
         // Give the child threads a buffer in case we fall a little behind with aggregating the stack
@@ -101,7 +123,25 @@ impl Recorder {
             raw_store = Some(Store::new(&raw_path, self.sample_rate)?);
         }
 
-        for trace in trace_receiver {
+        loop {
+            if std::time::Instant::now() >= next_export {
+                if let Some(exporter) = &mut exporter {
+                    exporter.flush();
+                    // Keep live-summary cardinality bounded over an indefinite recording.
+                    *self.summary.lock().unwrap() = summary::Stats::new();
+                }
+                next_export = std::time::Instant::now() + interval;
+            }
+            let trace = match trace_receiver
+                .recv_timeout(next_export.saturating_duration_since(std::time::Instant::now()))
+            {
+                Ok(trace) => trace,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            if let Some(exporter) = &mut exporter {
+                exporter.record(&trace);
+            }
             if let Some(out) = &mut out {
                 out.record(&trace)?;
             }
@@ -112,6 +152,8 @@ impl Recorder {
             let mut summary = self.summary.lock().unwrap();
             summary.add_function_name(&trace.trace);
         }
+
+        let export_result = exporter.map(|e| e.finish()).transpose();
 
         // Finish writing all data to disk
         if let (Some(out), Some(out_path)) = (&mut out, self.out_path.as_ref()) {
@@ -141,6 +183,7 @@ impl Recorder {
             last_result = result;
         }
 
+        export_result?;
         match num_ok {
             0 => last_result,
             _ => Ok(()),

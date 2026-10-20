@@ -76,3 +76,15 @@ https://www.rust-lang.org/ has great resources for learning Rust.
 1. `cargo test` to test
 
 The built binary will end up at `target/debug/rbspy`
+
+### Continuous profiling
+
+Export profiles periodically to an OpenTelemetry Collector:
+
+```sh
+rbspy record --pid 1234 --service-name my-ruby-service \
+  --otlp-endpoint http://localhost:4318/v1development/profiles
+```
+
+See [continuous profiling](docs/continuous-profiling.md) for Collector setup,
+export intervals, buffering, and schema compatibility.
